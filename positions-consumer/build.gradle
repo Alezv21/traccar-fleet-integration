@@ -1,0 +1,9 @@
+description = 'Consumer for vehicle position updates from Artemis AMQP'
+
+dependencies {
+    implementation project(':common')
+}
+
+application {
+    mainClass = 'org.example.fleet.positions.MainApp'
+}

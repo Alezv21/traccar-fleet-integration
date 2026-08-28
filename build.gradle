@@ -1,0 +1,70 @@
+plugins {
+    id 'base'
+}
+
+group = 'org.example.fleet'
+version = '1.0.0'
+
+ext {
+    camelVersion = '4.8.0'
+    artemisVersion = '2.31.2'
+    logbackVersion = '1.5.28'
+}
+
+subprojects {
+    apply plugin: 'java'
+
+    group = rootProject.group
+    version = rootProject.version
+
+    repositories {
+        mavenCentral()
+    }
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(21)
+        }
+    }
+
+    dependencies {
+        implementation platform("org.apache.camel:camel-bom:${rootProject.camelVersion}")
+
+        implementation 'org.apache.camel:camel-core'
+        implementation 'org.apache.camel:camel-main'
+        implementation 'org.apache.camel:camel-jackson'
+        implementation 'org.apache.camel:camel-log'
+        implementation 'org.apache.camel:camel-jsonpath'
+        implementation 'org.apache.camel:camel-amqp'
+        implementation 'org.apache.camel:camel-jms'
+
+        implementation "org.apache.activemq:artemis-jakarta-client:${rootProject.artemisVersion}"
+
+        implementation 'org.slf4j:slf4j-api'
+        implementation "ch.qos.logback:logback-classic:${rootProject.logbackVersion}"
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+        options.release = 21
+    }
+}
+
+// Application and fat-jar assembly only for service modules (not common library)
+configure([project(':broker'), project(':positions-consumer'), project(':events-consumer'), project(':mediator')]) {
+    apply plugin: 'application'
+
+    tasks.named('jar') {
+        archiveBaseName = project.name
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+        manifest {
+            attributes('Main-Class': application.mainClass.get())
+        }
+        from {
+            configurations.runtimeClasspath.collect { dependency ->
+                dependency.isDirectory() ? dependency : zipTree(dependency)
+            }
+        }
+        exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
+    }
+}

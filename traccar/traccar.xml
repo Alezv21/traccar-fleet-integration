@@ -1,0 +1,56 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE properties SYSTEM 'http://java.sun.com/dtd/properties.dtd'>
+<properties>
+    <!-- Web UI -->
+    <entry key='web.port'>8082</entry>
+    <entry key='web.path'>./web</entry>
+
+    <!-- Logging -->
+    <entry key='logger.level'>info</entry>
+    <entry key='logger.file'>./logs/tracker.log</entry>
+    <entry key='logger.rotate'>true</entry>
+
+    <!-- Database: use H2 (embedded, ephemeral for demo purposes) -->
+    <entry key='database.ignoreUnknown'>true</entry>
+    <entry key='database.changelog'>./schema/changelog-master.xml</entry>
+    <entry key='database.driver'>org.h2.Driver</entry>
+    <entry key='database.url'>jdbc:h2:./data/traccar</entry>
+    <entry key='database.user'>sa</entry>
+    <entry key='database.password'></entry>
+
+    <!-- Device protocols -->
+    <entry key='gps103.port'>5001</entry>
+    <entry key='tk103.port'>5002</entry>
+    <entry key='osmand.port'>5055</entry>
+
+    <!-- Position and Event Forwarding to Camel Broker (HTTP JSON format) -->
+    <entry key='forward.url'>http://broker:8080/traccar/ingest</entry>
+    <entry key='forward.type'>json</entry>
+    <entry key='event.forward.url'>http://broker:8080/traccar/ingest</entry>
+    <entry key='event.forward.type'>json</entry>
+
+
+    <!-- Position and Event Forwarding to Camel Mediator (MQTT JSON format) -->
+    <!--entry key='forward.url'>mqtt://artemis:artemis@artemis:1883</entry>
+    <entry key='forward.type'>mqtt</entry>
+    <entry key='forward.topic'>traccar/positions</entry>
+    <entry key='event.forward.url'>mqtt://artemis:artemis@artemis:1883</entry>
+    <entry key='event.forward.type'>mqtt</entry>
+    <entry key='event.forward.topic'>traccar/events</entry-->
+
+    <!-- Processing -->
+    <entry key='processing.computedAttributes.enable'>true</entry>
+    <entry key='processing.engineHours.enable'>true</entry>
+
+    <!-- Notifications -->
+    <entry key='notificator.types'>web</entry>
+
+    <!-- Filtering -->
+    <entry key='filter.enable'>true</entry>
+    <entry key='filter.future'>86400</entry>
+
+    <!-- Commands -->
+    <entry key='commands.queueing'>true</entry>
+
+    <entry key='registration.enable'>true</entry>
+</properties>

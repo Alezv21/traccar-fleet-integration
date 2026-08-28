@@ -1,0 +1,9 @@
+description = 'AMQP message mediator — receives Traccar forwards and publishes to Artemis AMQP'
+
+dependencies {
+    implementation project(':common')
+}
+
+application {
+    mainClass = 'org.example.fleet.mediator.MainApp'
+}

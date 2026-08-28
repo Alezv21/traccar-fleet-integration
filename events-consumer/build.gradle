@@ -1,0 +1,9 @@
+description = 'Consumer for vehicle events from Artemis AMQP'
+
+dependencies {
+    implementation project(':common')
+}
+
+application {
+    mainClass = 'org.example.fleet.events.MainApp'
+}

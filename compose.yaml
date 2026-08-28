@@ -1,0 +1,102 @@
+services:
+  artemis:
+    image: apache/activemq-artemis:latest-alpine
+    container_name: artemis-fleet
+    environment:
+      - ANONYMOUS_LOGIN=true
+      - ARTEMIS_USER
+      - ARTEMIS_PASSWORD
+    ports:
+      - "5672:5672"   # AMQP 1.0 acceptor
+      - "61616:61616" # Core/OpenWire acceptor
+      - "1883:1883" # MQTT acceptor
+      - "8161:8161"   # Web console
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8161"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fleet-net
+    restart: unless-stopped
+
+  traccar:
+    image: traccar/traccar:latest
+    container_name: traccar-fleet
+    ports:
+      - "8082:8082"   # Web UI / REST API
+      - "5001:5001"   # gps103 protocol
+      - "5002:5002"   # TK103 protocol
+      - "5055:5055"   # OsmAnd protocol (used for GPS ping simulation)
+    volumes:
+      - ./traccar/traccar.xml:/opt/traccar/conf/traccar.xml:ro
+    #depends_on:
+    #  artemis:
+    #    condition: service_healthy
+    environment:
+      - CONFIG_USE_ENVIRONMENT_VARIABLES=true
+      - DATABASE_USER
+      - DATABASE_PASSWORD
+    networks:
+      - fleet-net
+    restart: unless-stopped
+
+  broker:
+    build:
+      context: .
+      dockerfile: broker/Dockerfile
+      additional_contexts:
+        m2-cache: ${HOME}/.m2
+    container_name: broker-fleet
+    environment:
+      - ARTEMIS_AMQP_URL=${ARTEMIS_AMQP_URL:-amqp://artemis:5672}
+      - ARTEMIS_USER
+      - ARTEMIS_PASSWORD
+    ports:
+      - "8080:8080"   # HTTP endpoint for Traccar forwards
+    depends_on:
+      artemis:
+        condition: service_healthy
+    networks:
+      - fleet-net
+    restart: unless-stopped
+
+  positions-consumer:
+    build:
+      context: .
+      dockerfile: positions-consumer/Dockerfile
+      additional_contexts:
+        m2-cache: ${HOME}/.m2
+    container_name: positions-consumer-fleet
+    environment:
+      - ARTEMIS_AMQP_URL=${ARTEMIS_AMQP_URL:-amqp://artemis:5672}
+      - ARTEMIS_USER
+      - ARTEMIS_PASSWORD
+    depends_on:
+      artemis:
+        condition: service_healthy
+    networks:
+      - fleet-net
+    restart: unless-stopped
+
+  events-consumer:
+    build:
+      context: .
+      dockerfile: events-consumer/Dockerfile
+      additional_contexts:
+        m2-cache: ${HOME}/.m2
+    container_name: events-consumer-fleet
+    environment:
+      - ARTEMIS_AMQP_URL=${ARTEMIS_AMQP_URL:-amqp://artemis:5672}
+      - ARTEMIS_USER
+      - ARTEMIS_PASSWORD
+    depends_on:
+      artemis:
+        condition: service_healthy
+    networks:
+      - fleet-net
+    restart: unless-stopped
+
+networks:
+  fleet-net:
+    driver: bridge

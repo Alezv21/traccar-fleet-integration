@@ -1,0 +1,34 @@
+- route:
+    id: post-submit
+    from:
+      uri: "direct:post-submit"
+      steps:
+        - log:
+            message: "Publishing to broker queue"
+        - pipeline:
+            steps:
+              - to:
+                  uri: "log:request?showBody=true&showHeaders=true"
+              - to:
+                  uri: amqp:queue:ingest
+                  pattern: InOnly
+        - setHeader:
+            name: Content-Type
+            constant: application/json
+        - setBody:
+            simple: '{"status": "ok"}'
+        - marshal:
+            json:
+              library: Jackson
+
+- restConfiguration:
+    component: platform-http
+    host: 0.0.0.0
+    port: 8080
+
+- rest:
+    path: /traccar
+    post:
+      - path: /ingest
+        consumes: "application/json"
+        to: "direct:post-submit"

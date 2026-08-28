@@ -1,0 +1,13 @@
+description = 'HTTP gateway and message broker — receives Traccar forwards and publishes to Artemis AMQP'
+
+dependencies {
+    implementation project(':common')
+
+    implementation 'org.apache.camel:camel-platform-http'
+    implementation 'org.apache.camel:camel-platform-http-main'
+    implementation 'org.apache.camel:camel-yaml-dsl'
+}
+
+application {
+    mainClass = 'org.example.fleet.broker.MainApp'
+}
