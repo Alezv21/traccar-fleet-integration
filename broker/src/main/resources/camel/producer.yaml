@@ -32,3 +32,4 @@
       - path: /ingest
         consumes: "application/json"
         to: "direct:post-submit"
+

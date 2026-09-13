@@ -1,0 +1,16 @@
+{
+  "request": {
+    "method": "POST",
+    "url": "/push"
+  },
+  "response": {
+    "status": 202,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "estado": "ACEPTADO",
+      "mensaje": "Push simulado recibido"
+    }
+  }
+}

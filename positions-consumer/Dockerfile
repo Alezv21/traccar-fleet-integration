@@ -1,15 +1,20 @@
 # syntax=docker/dockerfile:1
-FROM scratch AS m2-cache
-FROM gradle:9.2.1-jdk21-corretto AS builder
+
+FROM gradle:9.6.0-jdk21-ubi10 AS builder
+
 WORKDIR /build
+
 RUN chown gradle:gradle /build
 
-COPY --chown gradle:gradle . ./
+COPY --chown=gradle:gradle . ./
 
-RUN --mount=type=bind,from=m2-cache,target=/home/gradle/.m2 \
-    gradle :positions-consumer:build -x test --no-daemon
+RUN --mount=type=cache,target=/home/gradle/.gradle \
+    gradle :positions-consumer:installDist -x test --no-daemon
 
-FROM amazoncorretto:21-alpine-jre
+FROM amazoncorretto:21-al2
+
 WORKDIR /app
-COPY --from=builder /build/positions-consumer/build/libs/positions-consumer-1.0.0.jar app.jar
-ENTRYPOINT ["java", "-jar", "app.jar"]
+
+COPY --from=builder /build/positions-consumer/build/install/positions-consumer/lib/ /app/lib/
+
+ENTRYPOINT ["java", "-cp", "/app/lib/*", "org.example.fleet.positions.MainApp"]

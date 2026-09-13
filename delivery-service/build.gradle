@@ -1,0 +1,19 @@
+plugins {
+    id 'application'
+}
+
+description = 'Delivery order tracking service using Apache Camel and PostgreSQL'
+
+dependencies {
+    implementation project(':common')
+
+    implementation 'org.apache.camel:camel-platform-http'
+    implementation 'org.apache.camel:camel-platform-http-main'
+    implementation 'org.apache.camel:camel-http'
+
+    implementation 'org.postgresql:postgresql:42.7.4'
+}
+
+application {
+    mainClass = 'org.example.fleet.delivery.MainApp'
+}

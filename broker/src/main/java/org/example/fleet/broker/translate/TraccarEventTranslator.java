@@ -10,34 +10,95 @@ import java.util.UUID;
 
 /**
  * Translator from Traccar event JSON to canonical VehicleEvent record.
- * EIP Pattern: Message Translator — converts from Traccar's wire format to internal canonical model.
+ *
+ * EIP Pattern:
+ * Message Translator - converts Traccar's event format into
+ * the internal canonical model.
  */
 public class TraccarEventTranslator {
 
     public VehicleEvent translate(JsonNode traccarJson) throws Exception {
+
         JsonNode event = traccarJson.get("event");
 
-        String deviceId = event.get("deviceId").asText();
-        String eventType = event.get("type").asText();
-        long eventTimeMs = event.get("eventTime").asLong();
-        String timestamp = eventTimeMs > 0 ? Instant.ofEpochMilli(eventTimeMs).toString() : event.get("eventTime").asText();
+        if (event == null || event.isNull()) {
+            throw new IllegalArgumentException(
+                "El payload de Traccar no contiene event"
+            );
+        }
+
+        String deviceId = null;
+
+        JsonNode device = traccarJson.get("device");
+
+        if (device != null
+                && device.hasNonNull("uniqueId")
+                && !device.get("uniqueId").asText().isBlank()) {
+
+            deviceId = device.get("uniqueId").asText();
+
+        } else if (event.hasNonNull("deviceId")) {
+
+            deviceId = event.get("deviceId").asText();
+        }
+
+        if (deviceId == null || deviceId.isBlank()) {
+            throw new IllegalArgumentException(
+                "No se pudo determinar el deviceId del evento"
+            );
+        }
+
+        String eventType = event.path("type").asText();
+
+        JsonNode eventTimeNode = event.get("eventTime");
+
+        String timestamp;
+
+        if (eventTimeNode == null || eventTimeNode.isNull()) {
+
+            timestamp = Instant.now().toString();
+
+        } else if (eventTimeNode.isNumber()) {
+
+            timestamp = Instant
+                .ofEpochMilli(eventTimeNode.asLong())
+                .toString();
+
+        } else {
+
+            timestamp = eventTimeNode.asText();
+        }
 
         String positionId = null;
-        if (event.has("positionId") && !event.get("positionId").isNull()) {
-            positionId = String.valueOf(event.get("positionId").asInt());
+
+        if (event.hasNonNull("positionId")) {
+            positionId = event.get("positionId").asText();
         }
 
         String geofenceId = null;
-        if (event.has("geofenceId") && !event.get("geofenceId").isNull()) {
-            geofenceId = String.valueOf(event.get("geofenceId").asInt());
+
+        if (event.hasNonNull("geofenceId")) {
+            geofenceId = event.get("geofenceId").asText();
         }
 
-        // Passthrough attributes
         Map<String, Object> attributes = new HashMap<>();
+
         JsonNode attrsNode = event.get("attributes");
+
         if (attrsNode != null && attrsNode.isObject()) {
+
             attrsNode.fields().forEachRemaining(entry ->
-                attributes.put(entry.getKey(), entry.getValue().asText())
+                attributes.put(
+                    entry.getKey(),
+                    entry.getValue().asText()
+                )
+            );
+        }
+
+        if (event.hasNonNull("deviceId")) {
+            attributes.put(
+                "traccarDeviceId",
+                event.get("deviceId").asText()
             );
         }
 
