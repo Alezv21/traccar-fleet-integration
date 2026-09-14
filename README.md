@@ -1,324 +1,1692 @@
-# Traccar → Camel → Artemis (AMQP) Fleet Integration Example
+# Traccar Fleet Integration – Seguimiento de Pedidos con GPS
 
-A practical example demonstrating real-time vehicle fleet tracking data integration using Apache Camel as the messaging integrator, connecting Traccar (GPS tracking server) to ActiveMQ Artemis (message broker) via AMQP 1.0 protocol.
+Proyecto de integración orientado a eventos para el seguimiento de pedidos y repartidores mediante GPS.
 
-## Architecture Overview
+La solución extiende el proyecto base **Traccar Fleet Integration** incorporando lógica de negocio para delivery:
 
-```
-Traccar (GPS data source)
-    ↓ HTTP JSON (forward.url)
-Camel Broker (Messaging Gateway + Content-Based Router + Message Translator)
-    ↓ AMQP 1.0 Pub-Sub Channels
-Artemis (Message Broker)
-    ↓ AMQP Durable Subscriptions
-Positions Consumer ← → Events Consumer
-```
+- recepción de pedidos mediante API REST;
+- asignación de pedidos a repartidores;
+- recepción de posiciones GPS reales mediante Traccar;
+- transformación de datos a un modelo canónico;
+- publicación y consumo de eventos mediante Apache ActiveMQ Artemis;
+- correlación entre repartidor y pedido;
+- cálculo de distancia mediante Haversine;
+- máquina de estados del pedido;
+- persistencia en PostgreSQL;
+- notificaciones PUSH simuladas mediante WireMock;
+- procesamiento idempotente;
+- manejo de errores mediante Dead Letter Queue;
+- herramientas de prueba con JBang;
+- pruebas end-to-end automatizadas con PowerShell.
 
-### EIP Patterns Used
+Repositorio:
 
-| Component | Pattern | Description |
-|-----------|---------|-------------|
-| Broker | **Messaging Gateway** | HTTP endpoint abstracts Traccar from internal architecture |
-| Broker | **Content-Based Router** | Classifies incoming payloads into position vs. event branches |
-| Broker | **Message Translator** | Converts Traccar JSON to canonical internal models |
-| Broker | **Canonical Data Model** | Shared `VehiclePosition` and `VehicleEvent` records |
-| Broker | **Publish-Subscribe Channel** | AMQP topics (`vehicle.positions`, `vehicle.events`) |
-| Consumers | **Durable Subscriber** | Maintain subscriptions even if consumer is offline |
-| Consumers | **Message Filter** | Discard invalid positions (`valid=false`) |
-
-## Prerequisites
-
-- Docker and Docker Compose v5.0+
-- Docker BuildKit enabled (default in Docker 24+)
-- Gradle wrapper included (no separate Gradle installation required)
-- Sufficient disk space for local cache sharing (`~/.gradle` and `~/.m2`)
-
-## Quick Start
-
-### 0. Local compilation (optional, before Docker)
-
-If you want to compile locally first (helpful for development):
-
-```bash
-cd example/traccar-fleet-integration
-
-# Using gradle from sdkman
-sdk env 
-gradle clean build -x test
-
+```text
+https://github.com/Alezv21/traccar-fleet-integration
 ```
 
-Generated JARs appear in `*/build/libs/` for each module.
+---
 
-### 1. Set up environment variables
+# 1. Tecnologías utilizadas
 
-```bash
-cd example/traccar-fleet-integration
-cp .env.example .env
-# Edit .env if you want custom Artemis credentials (default: admin/admin123)
+La solución utiliza:
+
+- Java 21
+- Apache Camel 4.8.0
+- Gradle 9.6
+- Apache ActiveMQ Artemis 2.31.2
+- PostgreSQL 16
+- Traccar
+- WireMock
+- JBang
+- Docker
+- Docker Compose
+- PowerShell
+- Python para los scripts originales de simulación GPS
+
+---
+
+# 2. Objetivo
+
+El objetivo del proyecto es implementar una arquitectura de integración orientada a eventos para realizar el seguimiento de pedidos asignados a repartidores.
+
+Cada repartidor posee un identificador GPS.
+
+Cuando Traccar recibe una nueva posición:
+
+1. Traccar reenvía el mensaje al broker de integración.
+2. Apache Camel clasifica el mensaje.
+3. La posición es transformada a un modelo canónico.
+4. El mensaje es publicado en Artemis.
+5. `delivery-service` consume el evento.
+6. Se correlaciona `deviceId` con el pedido activo.
+7. Se calcula la distancia hasta el destino.
+8. Se actualiza el estado del pedido.
+9. Se persiste la última ubicación en PostgreSQL.
+10. Si corresponde, se genera una notificación PUSH.
+
+---
+
+# 3. Arquitectura
+
+```mermaid
+flowchart LR
+
+    CLIENTE[Cliente / API REST]
+
+    GPS[Dispositivo GPS<br/>OsmAnd]
+
+    TRACCAR[Traccar]
+
+    BROKER[Broker<br/>Apache Camel]
+
+    ARTEMIS[(ActiveMQ Artemis)]
+
+    DELIVERY[Delivery Service<br/>Apache Camel]
+
+    POSTGRES[(PostgreSQL)]
+
+    WIREMOCK[WireMock<br/>PUSH simulado]
+
+    JBANG[JBang Tools]
+
+    DLQ[(delivery.errors)]
+
+    CLIENTE -->|POST /api/pedidos| DELIVERY
+
+    GPS -->|HTTP GPS| TRACCAR
+
+    TRACCAR -->|Forward JSON| BROKER
+
+    BROKER -->|Canonical Model| ARTEMIS
+
+    ARTEMIS -->|vehicle.positions| DELIVERY
+
+    DELIVERY -->|Estados / Tracking| POSTGRES
+
+    DELIVERY -->|HTTP POST /push| WIREMOCK
+
+    JBANG -->|delivery.order.events| ARTEMIS
+
+    DELIVERY -->|Pedido inexistente| DLQ
+
+    JBANG -->|Consume errores| DLQ
 ```
 
-### 2. Build and start all services
+---
 
-```bash
-docker compose build
-docker compose up -d
-docker compose ps  # Verify all containers are healthy
+# 4. Flujo principal
+
+El flujo principal de seguimiento es:
+
+```text
+GPS
+ ↓
+Traccar
+ ↓
+Broker Apache Camel
+ ↓
+Transformación al modelo canónico
+ ↓
+Artemis
+vehicle.positions
+ ↓
+Delivery Service
+ ↓
+Correlación deviceId ↔ pedido
+ ↓
+Haversine
+ ↓
+Máquina de estados
+ ↓
+PostgreSQL
+ ↓
+PUSH
+ ↓
+WireMock
 ```
 
-**First build** may take 2-3 minutes (downloads Gradle dependencies, seeds local caches). Subsequent builds are faster due to BuildKit cache mounts and the host's `~/.gradle` / `~/.m2` caches.
+---
 
-### 3. Bootstrap Traccar (one-time setup)
+# 5. Estados del pedido
 
-**Note:** Traccar has no default user/password. The first access presents a self-registration form.
+Los pedidos utilizan la siguiente máquina de estados:
 
-#### Step 3a: Create Traccar admin account
-
-1. Open http://localhost:8082 in a browser
-2. Complete the initial admin registration form (email, password, name)
-3. Use the password from `ADMIN_PASSWORD` in your `.env` file (default: `tracar`)
-
-```bash
-# Load environment variables (ADMIN_PASSWORD from .env)
-source .env
-
-curl -X POST \
-  http://localhost:8082/api/users \
-  -H "Content-Type: application/json" \
-  -u "admin:${ADMIN_PASSWORD}" \
-  -d '{
-    "name": "John Doe",
-    "email": "john.doe@example.com",
-    "password": "SecurePassword123"
-  }'
+```text
+RECIBIDO
+   ↓
+EN_CAMINO
+   ↓
+CERCA
+   ↓
+ENTREGADO
 ```
 
-#### Step 3b: Create a test device via REST API
+También existe el estado:
 
-```bash
-# Load environment variables (ADMIN_PASSWORD from .env)
-source .env
-
-# Create device with unique ID "demo-vehicle-1"
-curl -u admin:${ADMIN_PASSWORD} -X POST http://localhost:8082/api/devices \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Demo Vehicle 1",
-    "uniqueId": "demo-vehicle-1"
-  }'
+```text
+CANCELADO
 ```
 
-**Expected response:** JSON with device details including `id` field.
+aunque no forma parte del flujo GPS demostrado en este trabajo.
 
-**If 401 Unauthorized:** The admin account wasn't created yet, or the password in `.env` doesn't match what you registered in Step 3a.
+## RECIBIDO
 
-### 4. Verify the message pipeline end-to-end
+El pedido fue creado correctamente y asignado a un repartidor.
 
-#### Watch broker logs
+## EN_CAMINO
 
-```bash
+Se recibe la primera posición GPS válida del repartidor.
+
+## CERCA
+
+La distancia calculada entre el repartidor y el destino es menor o igual al radio configurado.
+
+Para la demostración:
+
+```text
+radioLlegadaM = 150 metros
+```
+
+## ENTREGADO
+
+La distancia entre el repartidor y el destino es:
+
+```text
+<= 30 metros
+```
+
+---
+
+# 6. Cálculo de distancia
+
+La distancia entre la posición GPS y el destino se calcula mediante la fórmula de Haversine.
+
+La implementación considera el radio terrestre aproximado:
+
+```text
+6.371.000 metros
+```
+
+Esto permite calcular la distancia geográfica entre:
+
+```text
+(latitudActual, longitudActual)
+```
+
+y:
+
+```text
+(latitudDestino, longitudDestino)
+```
+
+---
+
+# 7. Modelo canónico de posición
+
+Las posiciones provenientes de Traccar son transformadas antes de publicarse en Artemis.
+
+Ejemplo:
+
+```json
+{
+  "schemaVersion": "1.0",
+  "messageId": "uuid",
+  "deviceId": "repartidor-01",
+  "timestamp": "2026-09-13T23:44:17Z",
+  "latitude": -25.2998,
+  "longitude": -57.6300,
+  "speedKmh": 22.224,
+  "course": 45.0,
+  "valid": true,
+  "attributes": {
+    "ignition": true
+  }
+}
+```
+
+El uso de un modelo canónico evita que los consumidores dependan directamente del formato utilizado internamente por Traccar.
+
+---
+
+# 8. Correlación pedido – repartidor
+
+Cada pedido contiene:
+
+```text
+repartidor_device_id
+```
+
+La posición canónica contiene:
+
+```text
+deviceId
+```
+
+Por ejemplo:
+
+```text
+Pedido:
+PED-DEMO-001
+repartidor_device_id = repartidor-01
+```
+
+Posición:
+
+```text
+deviceId = repartidor-01
+```
+
+El sistema busca un pedido activo del repartidor con estado:
+
+```text
+RECIBIDO
+EN_CAMINO
+CERCA
+```
+
+Si no existe un pedido activo, la posición se consume pero no genera cambios de estado.
+
+---
+
+# 9. API REST
+
+El servicio de delivery expone una API REST mediante Apache Camel.
+
+Host local:
+
+```text
+http://localhost:8081
+```
+
+---
+
+## Crear pedido
+
+```http
+POST /api/pedidos
+```
+
+Ejemplo:
+
+```powershell
+$body = @{
+    id = "PED-001"
+    clienteNombre = "Cliente Demo"
+    clienteMsisdn = "+595981555555"
+    clienteFcmId = "fcm-demo-001"
+    direccionTexto = "San Lorenzo - Pedido Demo"
+    latDestino = -25.3000
+    lonDestino = -57.6300
+    radioLlegadaM = 150
+    repartidorDeviceId = "repartidor-01"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+    -Method POST `
+    -Uri "http://localhost:8081/api/pedidos" `
+    -ContentType "application/json" `
+    -Body $body
+```
+
+Respuesta esperada:
+
+```json
+{
+  "id": "PED-001",
+  "estado": "RECIBIDO",
+  "repartidorDeviceId": "repartidor-01",
+  "mensaje": "Pedido recibido correctamente"
+}
+```
+
+---
+
+## Consultar tracking
+
+```http
+GET /api/pedidos/{id}/tracking
+```
+
+Ejemplo:
+
+```powershell
+Invoke-RestMethod `
+    -Method GET `
+    -Uri "http://localhost:8081/api/pedidos/PED-001/tracking"
+```
+
+Ejemplo de respuesta:
+
+```json
+{
+  "id": "PED-001",
+  "estado": "ENTREGADO",
+  "repartidorDeviceId": "repartidor-01",
+  "clienteNombre": "Cliente Demo",
+  "direccionTexto": "San Lorenzo - Pedido Demo",
+  "latDestino": -25.3000,
+  "lonDestino": -57.6300,
+  "radioLlegadaM": 150,
+  "ultimaLatitud": -25.2998,
+  "ultimaLongitud": -57.6300,
+  "ultimaVelocidadKmh": 3.704,
+  "distanciaDestinoM": 22.24
+}
+```
+
+---
+
+# 10. Simulación GPS mediante Traccar
+
+El proyecto utiliza el protocolo OsmAnd de Traccar.
+
+Puerto:
+
+```text
+5055
+```
+
+Ejemplo:
+
+```powershell
+curl.exe "http://localhost:5055/?id=repartidor-01&lat=-25.2967&lon=-57.6359&speed=12&bearing=45&altitude=80&ignition=true"
+```
+
+---
+
+## Posición inicial
+
+Aproximadamente 697 metros del destino:
+
+```powershell
+curl.exe "http://localhost:5055/?id=repartidor-01&lat=-25.2967&lon=-57.6359&speed=12&bearing=45&altitude=80&ignition=true"
+```
+
+Produce:
+
+```text
+RECIBIDO → EN_CAMINO
+```
+
+---
+
+## Posición CERCA
+
+Aproximadamente 111 metros:
+
+```powershell
+curl.exe "http://localhost:5055/?id=repartidor-01&lat=-25.2990&lon=-57.6300&speed=8&bearing=45&altitude=80&ignition=true"
+```
+
+Produce:
+
+```text
+EN_CAMINO → CERCA
+```
+
+---
+
+## Posición ENTREGADO
+
+Aproximadamente 22 metros:
+
+```powershell
+curl.exe "http://localhost:5055/?id=repartidor-01&lat=-25.2998&lon=-57.6300&speed=2&bearing=45&altitude=80&ignition=true"
+```
+
+Produce:
+
+```text
+CERCA → ENTREGADO
+```
+
+---
+
+# 11. Apache ActiveMQ Artemis
+
+Artemis funciona como middleware de mensajería.
+
+Principales destinos utilizados:
+
+| Destino | Tipo | Función |
+|---|---|---|
+| `ingest` | Queue | Entrada inicial del broker |
+| `vehicle.positions` | Topic | Posiciones GPS canónicas |
+| `vehicle.events` | Topic | Eventos provenientes de Traccar |
+| `delivery.order.events` | Queue | Eventos externos relacionados con pedidos |
+| `delivery.errors` | Queue | Mensajes que no pueden procesarse |
+
+El servicio `delivery-service` posee una suscripción durable a:
+
+```text
+vehicle.positions
+```
+
+Esto desacopla la recepción GPS de la lógica del pedido.
+
+---
+
+# 12. PostgreSQL
+
+PostgreSQL almacena el estado del proceso de delivery.
+
+Base:
+
+```text
+delivery
+```
+
+Usuario:
+
+```text
+delivery
+```
+
+Puerto externo:
+
+```text
+55432
+```
+
+---
+
+## Tabla `repartidores`
+
+Contiene los repartidores disponibles.
+
+Ejemplo:
+
+```text
+repartidor-01
+repartidor-02
+```
+
+Los repartidores son cargados mediante el script inicial de PostgreSQL.
+
+No se implementa un CRUD de repartidores porque no forma parte del objetivo del trabajo.
+
+---
+
+## Tabla `pedidos`
+
+Almacena:
+
+- ID del pedido;
+- información del cliente;
+- destino;
+- repartidor;
+- estado;
+- radio de llegada;
+- fechas de creación y actualización.
+
+---
+
+## Tabla `pedido_ultima_posicion`
+
+Guarda la última posición GPS asociada al pedido:
+
+- pedido;
+- dispositivo;
+- latitud;
+- longitud;
+- velocidad;
+- distancia al destino;
+- timestamp.
+
+---
+
+## Tabla `pedido_eventos`
+
+Registra los hitos:
+
+```text
+RECIBIDO
+EN_CAMINO
+CERCA
+ENTREGADO
+```
+
+Existe una restricción:
+
+```text
+UNIQUE(pedido_id, hito)
+```
+
+que evita generar dos veces el mismo hito.
+
+---
+
+## Tabla `mensajes_procesados`
+
+Se utiliza para implementar el patrón:
+
+```text
+Idempotent Receiver
+```
+
+La clave primaria es:
+
+```text
+message_id
+```
+
+Si se recibe nuevamente el mismo mensaje, no se vuelve a aplicar la lógica de negocio.
+
+---
+
+# 13. PUSH simulado con WireMock
+
+WireMock representa un proveedor externo de notificaciones PUSH.
+
+Endpoint:
+
+```text
+POST /push
+```
+
+Host local:
+
+```text
+http://localhost:8089
+```
+
+Ejemplo de notificación:
+
+```json
+{
+  "notificationId": "PED-001:CERCA",
+  "pedidoId": "PED-001",
+  "hito": "CERCA",
+  "titulo": "Tu pedido esta cerca",
+  "mensaje": "El repartidor esta muy cerca de tu destino.",
+  "cliente": "Cliente Demo",
+  "msisdn": "+595981555555",
+  "fcmId": "fcm-demo-001"
+}
+```
+
+Se generan notificaciones para:
+
+```text
+EN_CAMINO
+CERCA
+ENTREGADO
+```
+
+`RECIBIDO` no genera PUSH.
+
+---
+
+# 14. Garantía de notificación At-Most-Once
+
+La solución utiliza una estrategia de notificación:
+
+```text
+AT-MOST-ONCE
+```
+
+Cada registro de `pedido_eventos` posee:
+
+```text
+notificado
+```
+
+El proceso de notificación busca:
+
+```sql
+notificado = false
+```
+
+para los hitos:
+
+```text
+EN_CAMINO
+CERCA
+ENTREGADO
+```
+
+Antes del envío HTTP, el evento es reclamado y marcado como:
+
+```text
+notificado = true
+```
+
+De esta manera, el mismo hito no vuelve a enviarse en ejecuciones posteriores del timer.
+
+## Trade-off
+
+Esta estrategia prioriza:
+
+```text
+no duplicar notificaciones
+```
+
+sobre:
+
+```text
+reintentar indefinidamente un PUSH fallido
+```
+
+Por lo tanto, cumple semántica:
+
+```text
+At-Most-Once
+```
+
+y no `At-Least-Once`.
+
+---
+
+# 15. Dead Letter Queue
+
+Se implementó un flujo de manejo de errores utilizando:
+
+```text
+delivery.order.events
+```
+
+y:
+
+```text
+delivery.errors
+```
+
+Flujo:
+
+```text
+Evento de pedido
+      ↓
+delivery.order.events
+      ↓
+Apache Camel
+      ↓
+¿Existe pedido?
+   /       \
+ Sí         No
+ ↓           ↓
+OK      delivery.errors
+```
+
+Si el evento referencia un pedido inexistente:
+
+```text
+PED-NO-EXISTE
+```
+
+se agrega:
+
+```text
+errorType = PEDIDO_INEXISTENTE
+```
+
+y el mensaje es enviado a:
+
+```text
+delivery.errors
+```
+
+---
+
+# 16. JBang
+
+JBang se utiliza para ejecutar herramientas Java sin crear un proyecto adicional.
+
+Scripts:
+
+```text
+scripts/OrderEventTool.java
+scripts/PositionTool.java
+```
+
+---
+
+## Publicar evento de pedido inexistente
+
+```powershell
+jbang .\scripts\OrderEventTool.java send
+```
+
+Ejemplo:
+
+```text
+[OK] Evento enviado
+Queue: delivery.order.events
+EventId: EVT-ERROR-...
+Pedido: PED-NO-EXISTE
+```
+
+---
+
+## Consumir Dead Letter Queue
+
+```powershell
+jbang .\scripts\OrderEventTool.java receive
+```
+
+Ejemplo:
+
+```text
+[OK] Mensaje encontrado en DLQ
+errorType: PEDIDO_INEXISTENTE
+```
+
+---
+
+## Publicar posición manualmente
+
+```powershell
+jbang `
+    .\scripts\PositionTool.java `
+    DEMO-001 `
+    repartidor-01 `
+    -25.2967 `
+    -57.6359 `
+    22.224
+```
+
+Esto permite probar directamente el canal:
+
+```text
+vehicle.positions
+```
+
+---
+
+# 17. Enterprise Integration Patterns utilizados
+
+El proyecto implementa varios patrones de integración.
+
+## Messaging Endpoint
+
+Apache Camel expone y consume distintos endpoints:
+
+```text
+REST
+AMQP
+HTTP
+Timer
+```
+
+---
+
+## Canonical Data Model
+
+Los datos provenientes de Traccar son convertidos a:
+
+```text
+VehiclePosition
+```
+
+evitando que los servicios consumidores dependan del formato original.
+
+---
+
+## Message Translator
+
+El broker transforma el JSON recibido desde Traccar hacia el modelo canónico.
+
+---
+
+## Publish / Subscribe
+
+Las posiciones se publican en:
+
+```text
+vehicle.positions
+```
+
+como topic.
+
+Esto permite que varios consumidores puedan reaccionar a la misma posición.
+
+---
+
+## Durable Subscriber
+
+`delivery-service` utiliza una suscripción durable a:
+
+```text
+vehicle.positions
+```
+
+---
+
+## Content Based Router
+
+Los mensajes son clasificados según su contenido.
+
+También se utiliza para decidir si un evento de pedido:
+
+```text
+pedido existe
+```
+
+o:
+
+```text
+pedido no existe
+```
+
+---
+
+## Correlation Identifier
+
+El campo:
+
+```text
+deviceId
+```
+
+permite correlacionar una posición GPS con el repartidor y su pedido activo.
+
+---
+
+## Idempotent Receiver
+
+El campo:
+
+```text
+messageId
+```
+
+se registra en:
+
+```text
+mensajes_procesados
+```
+
+para evitar reprocesamientos.
+
+---
+
+## Splitter
+
+El dispatcher de notificaciones obtiene varios eventos pendientes y los procesa individualmente.
+
+```text
+Lista de notificaciones
+        ↓
+     Splitter
+   /     |     \
+ PUSH   PUSH   PUSH
+```
+
+---
+
+## Dead Letter Channel
+
+Los eventos correspondientes a pedidos inexistentes son enviados a:
+
+```text
+delivery.errors
+```
+
+---
+
+# 18. Orquestación vs Coreografía
+
+Para la lógica principal del delivery se utiliza principalmente:
+
+```text
+ORQUESTACIÓN
+```
+
+El `delivery-service` concentra las reglas relacionadas con:
+
+- correlación del repartidor;
+- búsqueda del pedido;
+- cálculo de distancia;
+- transición de estados;
+- almacenamiento;
+- generación de hitos;
+- notificaciones.
+
+Esta decisión evita distribuir la máquina de estados entre múltiples servicios.
+
+Sin embargo, la comunicación de posiciones utiliza un enfoque desacoplado orientado a eventos:
+
+```text
+Traccar
+  ↓
+Broker
+  ↓
+Artemis
+  ↓
+Consumers
+```
+
+Por lo tanto, la solución combina:
+
+```text
+arquitectura orientada a eventos
++
+orquestación de la lógica de negocio
+```
+
+---
+
+# 19. Comunicación síncrona y asíncrona
+
+## Síncrona
+
+Se utiliza para:
+
+```text
+Cliente → POST /api/pedidos → Delivery Service
+```
+
+```text
+Cliente → GET /tracking → Delivery Service
+```
+
+```text
+Delivery Service → WireMock PUSH
+```
+
+---
+
+## Asíncrona
+
+Se utiliza para:
+
+```text
+Broker → Artemis → Delivery Service
+```
+
+y:
+
+```text
+JBang → Artemis → Delivery Service
+```
+
+Esto desacopla productores y consumidores.
+
+---
+
+# 20. Servicios Docker
+
+La solución completa contiene los siguientes servicios:
+
+```text
+artemis
+traccar
+broker
+positions-consumer
+events-consumer
+delivery-service
+postgres
+wiremock
+```
+
+Puertos principales:
+
+| Servicio | Puerto |
+|---|---:|
+| Broker REST | 8080 |
+| Delivery API | 8081 |
+| Traccar Web | 8082 |
+| WireMock | 8089 |
+| Artemis Console | 8161 |
+| Artemis | 61616 |
+| PostgreSQL | 55432 |
+| OsmAnd | 5055 |
+| GPS103 | 5001 |
+| TK103 | 5002 |
+
+---
+
+# 21. Ejecutar proyecto
+
+## Requisitos
+
+Se necesita:
+
+```text
+Java 21+
+Docker
+Docker Compose
+JBang
+PowerShell
+```
+
+Opcionalmente:
+
+```text
+Python 3
+```
+
+para ejecutar los scripts originales.
+
+---
+
+## Verificar Java
+
+```powershell
+java -version
+```
+
+---
+
+## Verificar Docker
+
+```powershell
+docker --version
+docker compose version
+```
+
+---
+
+## Verificar JBang
+
+```powershell
+jbang --version
+```
+
+---
+
+# 22. Compilar
+
+En Windows:
+
+```powershell
+.\gradlew.bat clean build
+```
+
+O únicamente `delivery-service`:
+
+```powershell
+.\gradlew.bat `
+    :delivery-service:clean `
+    :delivery-service:build
+```
+
+---
+
+# 23. Levantar infraestructura
+
+```powershell
+docker compose up -d --build
+```
+
+Consultar estado:
+
+```powershell
+docker compose ps
+```
+
+---
+
+# 24. Logs
+
+Todos:
+
+```powershell
+docker compose logs -f
+```
+
+Delivery:
+
+```powershell
+docker compose logs -f delivery-service
+```
+
+Broker:
+
+```powershell
 docker compose logs -f broker
 ```
 
-#### Simulate a GPS position update via OsmAnd protocol
+Consumidores:
 
-In a **new terminal**, send a simulated GPS ping:
+```powershell
+docker compose logs -f positions-consumer events-consumer
+```
+
+---
+
+# 25. Prueba automatizada end-to-end
+
+El proyecto incluye:
+
+```text
+scripts/demo.ps1
+```
+
+Este script ejecuta automáticamente todos los escenarios principales del trabajo.
+
+Ejecutar:
+
+```powershell
+powershell `
+    -ExecutionPolicy Bypass `
+    -File .\scripts\demo.ps1
+```
+
+Resultado esperado:
+
+```text
+====================================================
+RESULTADO FINAL
+====================================================
+
+TODAS LAS PRUEBAS FINALIZARON CORRECTAMENTE
+
+Resultado: 10/10 casos OK
+```
+
+---
+
+# 26. Casos de prueba
+
+## Caso 1 – Pedido RECIBIDO
+
+Verifica:
+
+```text
+POST /api/pedidos
+```
+
+Resultado:
+
+```text
+RECIBIDO
+```
+
+---
+
+## Caso 2 – GPS y modelo canónico
+
+Se envía una posición mediante Traccar.
+
+Se verifica que:
+
+```text
+GPS
+→ Traccar
+→ Broker
+→ Artemis
+→ Delivery Service
+→ PostgreSQL
+```
+
+funcione correctamente.
+
+---
+
+## Caso 3 – EN_CAMINO
+
+Primera posición válida:
+
+```text
+RECIBIDO → EN_CAMINO
+```
+
+Se verifica un único PUSH.
+
+---
+
+## Caso 4 – CERCA
+
+Posición aproximada:
+
+```text
+111.19 metros
+```
+
+Resultado:
+
+```text
+EN_CAMINO → CERCA
+```
+
+Se genera exactamente un nuevo PUSH.
+
+---
+
+## Caso 5 – ENTREGADO
+
+Posición aproximada:
+
+```text
+22.24 metros
+```
+
+Resultado:
+
+```text
+CERCA → ENTREGADO
+```
+
+Se genera exactamente un nuevo PUSH.
+
+---
+
+## Caso 6 – Idempotencia
+
+Se publica dos veces:
+
+```text
+messageId = DEMO-DUP-001
+```
+
+Resultado:
+
+```text
+1 mensaje procesado
+0 hitos duplicados
+0 PUSH duplicados
+```
+
+---
+
+## Caso 7 – GPS sin pedido activo
+
+Se envía una posición cuando el pedido ya está:
+
+```text
+ENTREGADO
+```
+
+Resultado:
+
+```text
+mensaje consumido
+pedido no modificado
+ningún nuevo hito
+```
+
+---
+
+## Caso 8 – Repartidor desconocido
+
+Se intenta crear un pedido para:
+
+```text
+repartidor-inexistente
+```
+
+Resultado:
+
+```text
+HTTP 400
+```
+
+y el pedido no se persiste.
+
+---
+
+## Caso 9 – Pedido inexistente y DLQ
+
+JBang publica un evento con:
+
+```text
+pedidoId = PED-NO-EXISTE
+```
+
+Camel lo enruta hacia:
+
+```text
+delivery.errors
+```
+
+con:
+
+```text
+errorType = PEDIDO_INEXISTENTE
+```
+
+---
+
+## Caso 10 – Tracking
+
+Se consulta:
+
+```text
+GET /api/pedidos/PED-DEMO-001/tracking
+```
+
+Resultado esperado:
+
+```text
+estado = ENTREGADO
+deviceId = repartidor-01
+distancia <= 30 metros
+última posición disponible
+```
+
+---
+
+# 27. Resultado de pruebas
+
+La ejecución completa obtuvo:
+
+```text
+10/10 casos OK
+```
+
+Estado final:
+
+```text
+Pedido:
+PED-DEMO-001
+
+Estado:
+ENTREGADO
+
+Repartidor:
+repartidor-01
+
+Última posición:
+-25.2998, -57.6300
+
+Distancia:
+22.24 metros
+```
+
+Historial:
+
+```text
+RECIBIDO
+EN_CAMINO
+CERCA
+ENTREGADO
+```
+
+Notificaciones:
+
+```text
+RECIBIDO  -> no
+EN_CAMINO -> sí
+CERCA     -> sí
+ENTREGADO -> sí
+```
+
+---
+
+# 28. Scripts originales
+
+El proyecto base también contiene scripts Python para realizar pruebas sobre Traccar.
+
+---
+
+## `test-generator.py`
+
+Simula movimiento continuo de un vehículo enviando posiciones GPS mediante OsmAnd.
+
+Ejemplo:
 
 ```bash
-curl "http://localhost:5055/?id=demo-vehicle-1&lat=-25.2967&lon=-57.6359&speed=12&bearing=45&altitude=80&ignition=true"
+python3 scripts/test-generator.py
 ```
 
-Expected sequence in broker logs:
-1. `[Broker] Received Traccar forward: ...` (raw HTTP body)
-2. `[Broker] Classified as POSITION`
-3. `[Broker] Published position to vehicle.positions`
-
-#### Watch positions consumer
-
-In a **third terminal**:
+Personalizado:
 
 ```bash
-docker compose logs -f positions-consumer
+python3 scripts/test-generator.py \
+  --device-id my-vehicle \
+  --speed 60 \
+  --period 2
 ```
 
-Expected log:
-```
-[PositionsConsumer] Device: demo-vehicle-1, Lat: -25.2967, Lon: -57.6359, Speed: 22.224 km/h, Timestamp: 2026-08-26T...
+Parámetros:
+
+```text
+--device-id
+--host
+--speed
+--period
 ```
 
-#### Watch events consumer
+---
 
-In a **fourth terminal**:
+## `test-trips.py`
+
+Envía posiciones de un recorrido predefinido.
 
 ```bash
-docker compose logs -f events-consumer
+python3 scripts/test-trips.py
 ```
 
-Expected logs (automatically triggered by device connection):
-```
-[EventsConsumer] Device: demo-vehicle-1, Event: deviceOnline, Timestamp: 2026-08-26T...
-```
+---
 
-#### Inspect Artemis message broker
+## `test-integration.py`
 
-Open http://localhost:8161 in a browser (Artemis console).
-
-- Username/password: admin/admin123 (from `.env`)
-- Navigate to **Addresses** tab
-- Inspect `vehicle.positions` and `vehicle.events` (multicast routing type)
-- Messages show as JSON body text (human-readable, not binary)
-
-### 5. Send more GPS data
-
-Try additional GPS pings with different locations to simulate movement:
+Ejecuta pruebas de integración sobre los protocolos configurados.
 
 ```bash
-# Simulate movement to a second location
-curl "http://localhost:5055/?id=demo-vehicle-1&lat=-25.2900&lon=-57.6500&speed=18&bearing=90&altitude=100&ignition=true"
-
-# Simulate stop (speed=0)
-curl "http://localhost:5055/?id=demo-vehicle-1&lat=-25.2900&lon=-57.6500&speed=0&bearing=90&altitude=100&ignition=true"
+python3 scripts/test-integration.py -v
 ```
 
-### 6. Tear down
+---
 
-```bash
-docker compose down -v
-# -v removes volumes (Traccar's H2 database is ephemeral, safe to remove)
+# 29. Protocolos Traccar
+
+El protocolo principal utilizado en la demostración es:
+
+```text
+OsmAnd
 ```
 
-## Project Structure
+Puerto:
 
+```text
+5055
 ```
+
+También se encuentran configurados:
+
+```text
+GPS103 → 5001
+TK103  → 5002
+```
+
+---
+
+# 30. Troubleshooting
+
+## Docker no inicia
+
+Verificar:
+
+```powershell
+docker compose ps
+```
+
+y:
+
+```powershell
+docker compose logs
+```
+
+---
+
+## No llegan posiciones GPS
+
+Verificar Traccar:
+
+```text
+http://localhost:8082
+```
+
+Confirmar que el dispositivo tenga:
+
+```text
+uniqueId = repartidor-01
+```
+
+---
+
+## Broker no recibe mensajes
+
+```powershell
+docker compose logs broker
+```
+
+Verificar la configuración de forwarding de Traccar.
+
+---
+
+## Delivery Service no recibe posiciones
+
+```powershell
+docker compose logs delivery-service
+```
+
+Verificar que exista la suscripción a:
+
+```text
+vehicle.positions
+```
+
+y que Artemis esté disponible.
+
+---
+
+## Artemis
+
+Consola:
+
+```text
+http://localhost:8161
+```
+
+Credenciales por defecto del proyecto:
+
+```text
+admin
+admin123
+```
+
+---
+
+## PostgreSQL
+
+Ejemplo:
+
+```powershell
+docker exec postgres-delivery `
+    psql `
+    -U delivery `
+    -d delivery
+```
+
+---
+
+## WireMock
+
+Ver cantidad de PUSH:
+
+```powershell
+$match = @{
+    method = "POST"
+    url = "/push"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+    -Method POST `
+    -Uri "http://localhost:8089/__admin/requests/count" `
+    -ContentType "application/json" `
+    -Body $match
+```
+
+---
+
+# 31. Limitaciones
+
+La solución fue desarrollada con objetivos académicos y de demostración.
+
+Entre las limitaciones actuales se encuentran:
+
+- las notificaciones PUSH son simuladas mediante WireMock;
+- no existe autenticación en la API REST de delivery;
+- los repartidores se inicializan mediante SQL;
+- no se implementó CRUD de repartidores;
+- la entrega se determina mediante proximidad GPS y no mediante confirmación manual;
+- la estrategia PUSH utiliza semántica at-most-once;
+- no se implementó reintento de PUSH fallido;
+- Traccar utiliza configuración orientada al entorno de demostración;
+- no se implementó alta disponibilidad de Artemis o PostgreSQL.
+
+---
+
+# 32. Estructura principal
+
+```text
 traccar-fleet-integration/
-├── common/                           # Canonical data models (shared by all services)
-│   ├── build.gradle
-│   └── src/main/java/org/example/fleet/model/
-│       ├── VehiclePosition.java      # EIP: Canonical Data Model
-│       └── VehicleEvent.java         # EIP: Canonical Data Model
 │
-├── broker/                           # HTTP gateway + AMQP publisher
-│   ├── build.gradle
-│   ├── Dockerfile                    # Multistage Gradle build with cache mounts
-│   └── src/main/java/org/example/fleet/broker/
-│       ├── MainApp.java
-│       ├── routes/
-│       │   └── IngestRoute.java      # EIP: Gateway + CBR + Translator
-│       └── translate/
-│           ├── TraccarPositionTranslator.java
-│           └── TraccarEventTranslator.java
+├── broker/
 │
-├── positions-consumer/               # AMQP durable subscriber (positions)
-│   ├── build.gradle
-│   ├── Dockerfile
-│   └── src/main/java/org/example/fleet/positions/
-│       ├── MainApp.java
-│       └── routes/PositionsConsumerRoute.java   # EIP: Durable Subscriber + Filter
+├── common/
 │
-├── events-consumer/                  # AMQP durable subscriber (events)
-│   ├── build.gradle
-│   ├── Dockerfile
-│   └── src/main/java/org/example/fleet/events/
-│       ├── MainApp.java
-│       └── routes/EventsConsumerRoute.java      # EIP: Durable Subscriber
+├── delivery-service/
+│   └── src/main/java/
+│       └── org/example/fleet/delivery/
+│           ├── config/
+│           ├── model/
+│           ├── repository/
+│           ├── routes/
+│           ├── service/
+│           └── MainApp.java
 │
-├── traccar/
-│   └── traccar.xml                   # Traccar config with forwarder settings
+├── events-consumer/
 │
-├── settings.gradle                   # Module inclusion
-├── build.gradle                      # Shared subprojects config (Camel BOM 4.5.0, Java 21)
-├── compose.yaml                      # All services + BuildKit cache mount config
-└── README.md                         # This file
+├── positions-consumer/
+│
+├── scripts/
+│   ├── demo.ps1
+│   ├── OrderEventTool.java
+│   ├── PositionTool.java
+│   ├── test-generator.py
+│   ├── test-trips.py
+│   └── test-integration.py
+│
+├── wiremock/
+│   └── mappings/
+│
+├── scripts/
+│   └── init.sql
+│
+├── compose.yaml
+├── build.gradle
+├── settings.gradle
+├── gradlew
+├── gradlew.bat
+└── README.md
 ```
 
-## Technology Stack
+> Dependiendo de la estructura final del repositorio, el script SQL puede encontrarse dentro del directorio `scripts`.
 
-- **Apache Camel 4.5.0** — EIP-based integration framework
-- **ActiveMQ Artemis** — AMQP message broker
-- **Apache Artemis Jackarta 2.31.2** — AMQP wire protocol
-- **Traccar 5.x** — Open-source GPS tracking server
-- **Java 21** — Latest LTS release
-- **Gradle 9.2.1** — Build automation with BuildKit cache support
+---
 
-## Key Design Decisions
+# 33. Conclusión
 
-### 1. HTTP JSON Bridge (not native AMQP in Traccar)
+La implementación demuestra una arquitectura de integración orientada a eventos utilizando Apache Camel y ActiveMQ Artemis.
 
-**Rationale**: Traccar's native `forward.type=amqp` targets RabbitMQ (AMQP 0-9-1), which is incompatible with Artemis's AMQP 1.0 acceptor. The Camel broker acts as the HTTP-to-AMQP-1.0 bridge, allowing:
-- Simple, battle-tested Traccar JSON forwarding (no Traccar code changes)
-- Clean integration point for the Camel messaging pipeline
-- Educational demonstration of the Messaging Gateway pattern
+El sistema integra:
 
-### 2. Canonical Data Model
+```text
+REST
+GPS
+Traccar
+Apache Camel
+ActiveMQ Artemis
+PostgreSQL
+WireMock
+JBang
+Docker
+```
 
-**Rationale**: Java 21 `record` types with JSON marshalling avoid:
-- Tight coupling to Traccar's wire format
-- Schema registry complexity (overkill for a course example)
-- Binary serialization (keeps messages human-readable in the Artemis console during demos)
+y permite seguir el ciclo completo de un pedido:
 
-### 3. Pub-Sub Topics (not Point-to-Point Queues)
+```text
+RECIBIDO
+   ↓
+EN_CAMINO
+   ↓
+CERCA
+   ↓
+ENTREGADO
+```
 
-**Rationale**: Durable subscriptions allow independent consumers to subscribe to the same topics without the broker needing to know about them in advance. This design supports future extensibility:
-- Adding a `stop-analyzer` subscriber to `vehicle.positions` requires **zero changes** to the broker, positions-consumer, or events-consumer.
-- Adding a `protobuf-converter` subscriber requires only **adding a new module** and deploying it — no coupling to existing services.
-
-### 4. Gradle Multi-Module with BuildKit Cache Mounts
-
-**Rationale**: 
-- Shares host's `~/.gradle` and `~/.m2` caches into Docker builds via `--mount=type=bind,from=<named-context>`
-- First build benefits from already-downloaded Camel BOM, Artemis JMS client, Qpid JMS client (if present locally)
-- Subsequent builds use BuildKit's persistent cache mount (`type=cache`), eliminating download latency
-- No dependency on Maven as the "canonical" build system — all builds are Gradle
-
-## Extending the Example (Phase 2)
-
-The following components can be added without modifying the core (broker, consumers):
-
-### Stop Analyzer (Content Enricher + Postgres)
-- New subscriber on `vehicle.positions`
-- Correlates positions against a Postgres itinerary/stops table
-- Publishes `vehicle_status_log` records (ON_ROUTE, AT_STOP, OFF_ROUTE)
-
-### Protobuf Converter (Message Translator)
-- New subscriber on `vehicle.positions`
-- Converts canonical JSON to Google Protobuf binary format
-- Publishes to `vehicle.positions.protobuf` queue for downstream systems
-
-Both additions are isolated from the core MVP and can be developed and tested independently.
-
-## Troubleshooting
-
-### Broker fails to start: "Connection refused: amqp://artemis:5672"
-
-- Ensure Artemis is healthy: `docker compose ps artemis` and check the HEALTHCHECK status.
-- Confirm the network: `docker network inspect traccar-fleet-integration_fleet-net` should list all containers.
-- Check Artemis logs: `docker compose logs artemis | tail -20`.
-
-### Traccar device not receiving GPS pings
-
-- Verify device was created: Log into Traccar UI (http://localhost:8082), **Devices** tab, should show "Demo Vehicle 1".
-- Check device unique ID matches the curl command (must be exactly `demo-vehicle-1`).
-- Verify OsmAnd protocol is enabled: `docker compose exec traccar cat /opt/traccar/conf/traccar.xml | grep osmand.port` should show `<entry key='osmand.port'>5055</entry>`.
-
-### Messages not appearing in Artemis console
-
-- Check Broker logs for translation errors: `docker compose logs broker | grep ERROR`.
-- Verify AMQP connection: `docker compose logs broker | grep "amqp://"` should show successful connections.
-- Check the firewall: AMQP port 5672 must be accessible from broker to artemis (should be automatic on the compose network).
-
-### Docker build fails: "COPY . ." context too large
-
-- Run `.dockerignore` is properly configured to exclude build artifacts and `.gradle` directories.
-- Confirm: `cat .dockerignore` should include `**/build/` and `**/.gradle/`.
-
-## Sources & References
-
-- [Apache Camel Documentation](https://camel.apache.org/)
-- [Enterprise Integration Patterns (EIP)](https://www.enterpriseintegrationpatterns.com/)
-- [ActiveMQ Artemis AMQP Support](https://activemq.apache.org/components/artemis/documentation/)
-- [Traccar Forwarding Documentation](https://www.traccar.org/forward/)
-- [Docker BuildKit Documentation](https://github.com/moby/buildkit)
-
-## License
-
-This example is provided as part of the UCOM IS22026 Messaging course.
+manteniendo desacoplamiento mediante mensajería, persistencia del estado, procesamiento idempotente, correlación de mensajes, manejo de errores mediante DLQ y notificaciones externas sin duplicación.
